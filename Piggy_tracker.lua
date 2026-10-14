@@ -678,3 +678,28 @@ keep(RunService.Heartbeat:Connect(function(dt)
 	end
 	render()
 end))
+
+--------------------------------------------------------------------
+-- Collapse / close
+--------------------------------------------------------------------
+local function setCollapsed(v)
+	collapsed = v
+	body.Visible = not v
+	panel.Size = UDim2.fromOffset(PANEL_W, v and TITLE_H or PANEL_H)
+	collapseBtn.Text = v and "+" or "-"
+	if not v then dirty = true end
+end
+collapseBtn.MouseButton1Click:Connect(function() setCollapsed(not collapsed) end)
+
+local function cleanup()
+	for _, c in ipairs(conns) do c:Disconnect() end
+	disconnectList(structConns)
+	disconnectList(valueConns)
+	disconnectList(charConns)
+	gui:Destroy()
+	if _G.AbilityTrackerCleanup == cleanup then _G.AbilityTrackerCleanup = nil end
+end
+closeBtn.MouseButton1Click:Connect(cleanup)
+_G.AbilityTrackerCleanup = cleanup
+
+gui.Parent = playerGui
