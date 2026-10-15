@@ -151,7 +151,7 @@ local TrapDropper = {
 	found = 0,
 	owned = 0,
 	SCAN_INTERVAL = 1.0,      -- rescan every 1s
-	MOVE_INTERVAL = 1 / 30,   -- try to move 30x per second
+	MOVE_INTERVAL = 1 / 10,   -- try to move 10x per second
 }
 
 -- Full descendant scan: robust to any folder nesting ("ItemFolder",
@@ -179,39 +179,37 @@ local function getTrapRoot(trap)
 	return nil
 end
 
--- Unanchor everything and calm the rig so physics can move it freely.
+-- Unanchor + calm the rig so we can teleport it cleanly.
+-- We do NOT touch CanCollide: unanchored parts at -500 have no floor anyway.
 local function prepTrap(trap)
 	for _, d in ipairs(trap:GetDescendants()) do
 		if d:IsA("BasePart") then
 			pcall(function() d.Anchored = false end)
-			pcall(function() d.CanCollide = false end) -- fall through the floor instead of bouncing
 		end
 	end
 	local hum = trap:FindFirstChildOfClass("Humanoid")
 	if hum then
 		pcall(function() hum.PlatformStand = true end)
-		pcall(function() hum:ChangeState(Enum.HumanoidStateType.Physics) end)
 	end
 	if not trap.PrimaryPart then getTrapRoot(trap) end
 end
 
--- Snap the model's pivot (and root) down to the target Y.
+-- Pure teleport. No velocity, no physics. Trap lands exactly on targetY
+-- and stays there. One CFrame write per move, so it's basically free.
 local function dropToY(trap, root, targetY)
-	local pivot = trap:GetPivot()
-	if pivot.Y <= targetY + 0.01 then return end
-	local rot = pivot - pivot.Position
-	local newPivot = CFrame.new(pivot.X, targetY, pivot.Z) * rot
-	pcall(function() trap:PivotTo(newPivot) end)
-	-- Belt-and-suspenders: also push the root directly in case pivot math drifts.
+	-- Already there? Do nothing.
+	if math.abs(root.Position.Y - targetY) < 1 then return end
+
+	-- Kill any residual physics so the trap can't drift after we place it.
 	pcall(function()
-		local rp = root.Position
-		local rrot = root.CFrame - rp
-		root.CFrame = CFrame.new(rp.X, targetY, rp.Z) * rrot
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
 	end)
-	-- Give it downward velocity too, so physics agrees with us.
-	pcall(function()
-		root.AssemblyLinearVelocity = Vector3.new(0, -300, 0)
-	end)
+
+	-- Single teleport: keep X, Z and rotation; only Y changes.
+	local p = root.Position
+	local r = root.CFrame - p
+	root.CFrame = CFrame.new(p.X, targetY, p.Z) * r
 end
 
 local function updateTraps(dt)
@@ -219,7 +217,7 @@ local function updateTraps(dt)
 	td.scanAcc += dt
 	td.moveAcc += dt
 
-	-- Periodic scan (cheap enough at 1 Hz, and never misses nested folders)
+	-- Periodic scan (cheap at 1 Hz, never misses nested folders)
 	if td.scanAcc >= td.SCAN_INTERVAL then
 		td.scanAcc = 0
 		td.traps = scanTraps()
@@ -242,7 +240,7 @@ local function updateTraps(dt)
 		else
 			local root = getTrapRoot(trap)
 			if root then
-				-- Try to own it (client-side call only succeeds when you're near)
+				-- Try to own it (only succeeds when you're near)
 				local owner = root:GetNetworkOwner()
 				if owner ~= LocalPlayer then
 					pcall(function() root:SetNetworkOwner(LocalPlayer) end)
@@ -466,7 +464,7 @@ yInput.FocusLost:Connect(function()
 	end
 end)
 
--- Status line so you can see whether the scan is finding traps at all
+-- Status line
 local status = Instance.new("TextLabel")
 status.Size = UDim2.new(1, -16, 0, 14)
 status.Position = UDim2.fromOffset(8, 56)
@@ -496,7 +494,7 @@ dropToggle.MouseButton1Click:Connect(function()
 end)
 
 --------------------------------------------------------------------
--- Drag: follows ONLY the finger/pointer that started on the title bar
+-- Drag
 --------------------------------------------------------------------
 do
 	local MOUSE = Enum.UserInputType.MouseButton1
@@ -537,7 +535,7 @@ do
 end
 
 --------------------------------------------------------------------
--- Watching the selected player (only that player, only while selected)
+-- Watching the selected player
 --------------------------------------------------------------------
 local function markDirty()
 	dirty = true
@@ -656,7 +654,6 @@ keep(Players.PlayerRemoving:Connect(removePlayer))
 --------------------------------------------------------------------
 local statusAcc = 0
 keep(RunService.Heartbeat:Connect(function(dt)
-	-- Trap dropper runs independently of the "dirty" flag
 	if TrapDropper.enabled then
 		updateTraps(dt)
 		statusAcc += dt
