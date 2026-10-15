@@ -3,15 +3,22 @@
 --   * equipped Survivor / Piggy abilities  (Players > name > Data > PlayerData)
 --   * the tool they are holding            (their character)
 --   * their Backpack contents              (Players > name > Backpack)
--- Event driven: nothing runs unless a player is selected, the panel is open and
--- something actually changed (checked at most 4 times a second).
+--
+-- Performance design:
+--   * No per-frame work. A small loop runs 4x/second ONLY while a player is
+--     selected and the panel is open; it stops completely when collapsed/closed.
+--   * Watchers are attached only to the selected player's Backpack, Data folders,
+--     ability values and character, and are removed while collapsed.
+--   * The label is only touched when the text actually changed.
+--   * A once-per-second safety refresh means a missed event can never leave
+--     stale info on screen.
 
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 
-local UPDATE_INTERVAL = 0.25 -- seconds between detail refreshes (max)
+local TICK = 0.25          -- seconds between checks while a player is selected
+local SAFETY_TICKS = 4     -- full refresh every 4 ticks (= 1 second)
 
 local ABILITY_FOLDERS = {
 	{ key = "SurvivorAbilityEquipped", label = "Survivor", color = "#7CE08A" },
@@ -36,12 +43,16 @@ if old then old:Destroy() end
 --------------------------------------------------------------------
 -- State
 --------------------------------------------------------------------
-local conns = {}       -- permanent connections
-local structConns = {} -- watching the selected player's tree
-local valueConns = {}  -- .Changed on the selected player's ability values
-local charConns = {}   -- watching the selected player's character
-local rows = {}        -- [Player] = TextButton
-local selected, dirty, rebind, collapsed = nil, false, false, false
+local conns = {}      -- permanent connections
+local selConns = {}   -- CharacterAdded of the selected player
+local treeConns = {}  -- Backpack / Data / ability folders / values
+local charConns = {}  -- the selected player's character
+local rows = {}       -- [Player] = TextButton
+
+local selected = nil
+local dirty, rebind, collapsed = false, false, false
+local watchedChar, lastHeld, lastText = nil, nil, nil
+local loopRunning = false
 
 local function keep(c)
 	conns[#conns + 1] = c
@@ -53,6 +64,10 @@ local function disconnectList(list)
 		list[i]:Disconnect()
 		list[i] = nil
 	end
+end
+
+local function markDirty()
+	dirty = true
 end
 
 --------------------------------------------------------------------
@@ -77,6 +92,7 @@ local function listValues(folder)
 	return items
 end
 
+-- "Name, Other x2" from the children of a container
 local function countedNames(container, toolsOnly)
 	local counts, order = {}, {}
 	for _, child in ipairs(container:GetChildren()) do
@@ -101,6 +117,17 @@ local function countedNames(container, toolsOnly)
 		parts[i] = counts[n] > 1 and (esc(n) .. " x" .. counts[n]) or esc(n)
 	end
 	return table.concat(parts, ", ")
+end
+
+-- cheap fingerprint of what a player is holding (used to detect equips)
+local function heldSignature(player)
+	local char = player.Character
+	if not char then return "" end
+	local names = {}
+	for _, c in ipairs(char:GetChildren()) do
+		if c:IsA("Tool") then names[#names + 1] = c.Name end
+	end
+	return table.concat(names, "|")
 end
 
 local function section(label, color, text)
@@ -138,127 +165,6 @@ local function buildText(player)
 end
 
 --------------------------------------------------------------------
--- Trap Dropper (LovestruckTrap)
---------------------------------------------------------------------
-local TRAP_NAME = "LovestruckTrap"
-
-local TrapDropper = {
-	enabled = false,
-	targetY = -500,
-	traps = {},
-	scanAcc = 0,
-	moveAcc = 0,
-	found = 0,
-	owned = 0,
-	SCAN_INTERVAL = 1.0,      -- rescan every 1s
-	MOVE_INTERVAL = 1 / 10,   -- try to move 10x per second
-}
-
--- Full descendant scan: robust to any folder nesting ("ItemFolder",
--- "ItemFolder1", numeric folders, sub-folders, whatever).
-local function scanTraps()
-	local found = {}
-	for _, d in ipairs(workspace:GetDescendants()) do
-		if d:IsA("Model") and d.Name == TRAP_NAME then
-			found[#found + 1] = d
-		end
-	end
-	return found
-end
-
-local function getTrapRoot(trap)
-	local root = trap:FindFirstChild("HumanoidRootPart")
-	if root and root:IsA("BasePart") then
-		if trap.PrimaryPart ~= root then trap.PrimaryPart = root end
-		return root
-	end
-	root = trap.PrimaryPart
-	if root and root:IsA("BasePart") and root.Parent then return root end
-	root = trap:FindFirstChildWhichIsA("BasePart")
-	if root then trap.PrimaryPart = root; return root end
-	return nil
-end
-
--- Unanchor + calm the rig so we can teleport it cleanly.
--- We do NOT touch CanCollide: unanchored parts at -500 have no floor anyway.
-local function prepTrap(trap)
-	for _, d in ipairs(trap:GetDescendants()) do
-		if d:IsA("BasePart") then
-			pcall(function() d.Anchored = false end)
-		end
-	end
-	local hum = trap:FindFirstChildOfClass("Humanoid")
-	if hum then
-		pcall(function() hum.PlatformStand = true end)
-	end
-	if not trap.PrimaryPart then getTrapRoot(trap) end
-end
-
--- Pure teleport. No velocity, no physics. Trap lands exactly on targetY
--- and stays there. One CFrame write per move, so it's basically free.
-local function dropToY(trap, root, targetY)
-	-- Already there? Do nothing.
-	if math.abs(root.Position.Y - targetY) < 1 then return end
-
-	-- Kill any residual physics so the trap can't drift after we place it.
-	pcall(function()
-		root.AssemblyLinearVelocity = Vector3.zero
-		root.AssemblyAngularVelocity = Vector3.zero
-	end)
-
-	-- Single teleport: keep X, Z and rotation; only Y changes.
-	local p = root.Position
-	local r = root.CFrame - p
-	root.CFrame = CFrame.new(p.X, targetY, p.Z) * r
-end
-
-local function updateTraps(dt)
-	local td = TrapDropper
-	td.scanAcc += dt
-	td.moveAcc += dt
-
-	-- Periodic scan (cheap at 1 Hz, never misses nested folders)
-	if td.scanAcc >= td.SCAN_INTERVAL then
-		td.scanAcc = 0
-		td.traps = scanTraps()
-		td.found = #td.traps
-		for _, trap in ipairs(td.traps) do
-			prepTrap(trap)
-		end
-	end
-
-	if td.moveAcc < td.MOVE_INTERVAL then return end
-	td.moveAcc = 0
-
-	local targetY = td.targetY
-	local ownedCount = 0
-	for i = #td.traps, 1, -1 do
-		local trap = td.traps[i]
-		if not trap.Parent then
-			table.remove(td.traps, i)
-			td.found = #td.traps
-		else
-			local root = getTrapRoot(trap)
-			if root then
-				-- Try to own it (only succeeds when you're near)
-				local owner = root:GetNetworkOwner()
-				if owner ~= LocalPlayer then
-					pcall(function() root:SetNetworkOwner(LocalPlayer) end)
-					owner = root:GetNetworkOwner()
-				end
-
-				-- Only move what we actually control -> no rubberband flicker
-				if owner == LocalPlayer then
-					ownedCount += 1
-					dropToY(trap, root, targetY)
-				end
-			end
-		end
-	end
-	td.owned = ownedCount
-end
-
---------------------------------------------------------------------
 -- GUI
 --------------------------------------------------------------------
 local gui = Instance.new("ScreenGui")
@@ -292,7 +198,6 @@ local viewport = cam and cam.ViewportSize or Vector2.new(800, 400)
 local PANEL_W = 280
 local PANEL_H = math.min(360, viewport.Y - 24)
 local TITLE_H = 34
-local CONTROLS_H = 76
 
 local panel = Instance.new("Frame")
 panel.Name = "Panel"
@@ -341,11 +246,10 @@ body.Position = UDim2.fromOffset(0, TITLE_H + 4)
 body.BackgroundTransparency = 1
 body.Parent = panel
 
--- Player list (fixed height so the trap controls at the bottom always fit)
-local LIST_H = 100
+-- Player list
 local list = Instance.new("ScrollingFrame")
 list.Position = UDim2.fromOffset(8, 0)
-list.Size = UDim2.new(1, -16, 0, LIST_H)
+list.Size = UDim2.new(1, -16, 0.38, 0)
 list.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
 list.BackgroundTransparency = 0.3
 list.BorderSizePixel = 0
@@ -363,11 +267,10 @@ listPad.PaddingLeft, listPad.PaddingRight = UDim.new(0, 4), UDim.new(0, 8)
 listPad.PaddingTop, listPad.PaddingBottom = UDim.new(0, 4), UDim.new(0, 4)
 listPad.Parent = list
 
--- Detail (fills space between list and trap controls)
-local DETAIL_TOP = LIST_H + 6
+-- Detail
 local detailFrame = Instance.new("ScrollingFrame")
-detailFrame.Position = UDim2.fromOffset(8, DETAIL_TOP)
-detailFrame.Size = UDim2.new(1, -16, 1, -(DETAIL_TOP + CONTROLS_H + 6))
+detailFrame.Position = UDim2.new(0, 8, 0.38, 6)
+detailFrame.Size = UDim2.new(1, -16, 0.62, -14)
 detailFrame.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
 detailFrame.BackgroundTransparency = 0.3
 detailFrame.BorderSizePixel = 0
@@ -396,105 +299,7 @@ detail.Text = HINT
 detail.Parent = detailFrame
 
 --------------------------------------------------------------------
--- Trap controls (bottom of body)
---------------------------------------------------------------------
-local controls = Instance.new("Frame")
-controls.Name = "TrapControls"
-controls.AnchorPoint = Vector2.new(0, 1)
-controls.Position = UDim2.new(0, 8, 1, -4)
-controls.Size = UDim2.new(1, -16, 0, CONTROLS_H)
-controls.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
-controls.BackgroundTransparency = 0.3
-controls.BorderSizePixel = 0
-controls.Parent = body
-round(controls, 8)
-
-local dropLabel = Instance.new("TextLabel")
-dropLabel.Size = UDim2.new(1, -80, 0, 22)
-dropLabel.Position = UDim2.fromOffset(8, 4)
-dropLabel.BackgroundTransparency = 1
-dropLabel.Font = Enum.Font.GothamBold
-dropLabel.TextSize = 13
-dropLabel.TextColor3 = Color3.new(1, 1, 1)
-dropLabel.TextXAlignment = Enum.TextXAlignment.Left
-dropLabel.Text = "Drop Lovestruck Traps"
-dropLabel.Parent = controls
-
-local dropToggle = newButton(controls, "OFF", UDim2.fromOffset(64, 22), Color3.fromRGB(80, 80, 90))
-dropToggle.AnchorPoint = Vector2.new(1, 0)
-dropToggle.Position = UDim2.new(1, -8, 0, 4)
-dropToggle.TextSize = 12
-
-local yLabel = Instance.new("TextLabel")
-yLabel.Size = UDim2.fromOffset(70, 24)
-yLabel.Position = UDim2.fromOffset(8, 28)
-yLabel.BackgroundTransparency = 1
-yLabel.Font = Enum.Font.GothamBold
-yLabel.TextSize = 13
-yLabel.TextColor3 = Color3.new(1, 1, 1)
-yLabel.TextXAlignment = Enum.TextXAlignment.Left
-yLabel.Text = "Target Y:"
-yLabel.Parent = controls
-
-local yInput = Instance.new("TextBox")
-yInput.Size = UDim2.new(1, -86, 0, 24)
-yInput.Position = UDim2.fromOffset(76, 28)
-yInput.BackgroundColor3 = Color3.fromRGB(30, 30, 42)
-yInput.BorderSizePixel = 0
-yInput.Font = Enum.Font.GothamMedium
-yInput.TextSize = 13
-yInput.TextColor3 = Color3.new(1, 1, 1)
-yInput.PlaceholderText = "-500"
-yInput.Text = "-500"
-yInput.ClearTextOnFocus = false
-yInput.TextXAlignment = Enum.TextXAlignment.Left
-yInput.Parent = controls
-round(yInput, 6)
-local yPad = Instance.new("UIPadding")
-yPad.PaddingLeft = UDim.new(0, 6)
-yPad.Parent = yInput
-
-yInput.FocusLost:Connect(function()
-	local n = tonumber(yInput.Text)
-	if n then
-		TrapDropper.targetY = n
-		yInput.Text = tostring(n)
-	else
-		yInput.Text = tostring(TrapDropper.targetY)
-	end
-end)
-
--- Status line
-local status = Instance.new("TextLabel")
-status.Size = UDim2.new(1, -16, 0, 14)
-status.Position = UDim2.fromOffset(8, 56)
-status.BackgroundTransparency = 1
-status.Font = Enum.Font.GothamMedium
-status.TextSize = 11
-status.TextColor3 = Color3.fromRGB(170, 170, 190)
-status.TextXAlignment = Enum.TextXAlignment.Left
-status.Text = "Idle."
-status.Parent = controls
-
-dropToggle.MouseButton1Click:Connect(function()
-	TrapDropper.enabled = not TrapDropper.enabled
-	if TrapDropper.enabled then
-		dropToggle.Text = "ON"
-		dropToggle.BackgroundColor3 = Color3.fromRGB(80, 180, 100)
-		TrapDropper.traps = scanTraps()
-		TrapDropper.found = #TrapDropper.traps
-		for _, t in ipairs(TrapDropper.traps) do prepTrap(t) end
-		TrapDropper.scanAcc = 0
-		TrapDropper.moveAcc = 0
-	else
-		dropToggle.Text = "OFF"
-		dropToggle.BackgroundColor3 = Color3.fromRGB(80, 80, 90)
-		status.Text = "Idle."
-	end
-end)
-
---------------------------------------------------------------------
--- Drag
+-- Drag: follows ONLY the finger/pointer that started on the title bar
 --------------------------------------------------------------------
 do
 	local MOUSE = Enum.UserInputType.MouseButton1
@@ -535,22 +340,46 @@ do
 end
 
 --------------------------------------------------------------------
--- Watching the selected player
+-- Watchers for the selected player (narrow: only the known locations)
 --------------------------------------------------------------------
-local function markDirty()
-	dirty = true
-end
+local function bindTree(player)
+	disconnectList(treeConns)
 
-local function bindValues(player)
-	disconnectList(valueConns)
+	local function add(signal, fn)
+		treeConns[#treeConns + 1] = signal:Connect(fn)
+	end
+	-- container changed -> re-attach watchers (a new Backpack/Data may have appeared)
+	local function structural()
+		dirty = true
+		rebind = true
+	end
+
+	add(player.ChildAdded, structural)
+	add(player.ChildRemoved, structural)
+
+	local backpack = player:FindFirstChild("Backpack")
+	if backpack then
+		add(backpack.ChildAdded, markDirty)
+		add(backpack.ChildRemoved, markDirty)
+	end
+
+	local data = player:FindFirstChild("Data")
+	if data then
+		add(data.ChildAdded, structural)
+		add(data.ChildRemoved, structural)
+	end
+
 	local pd = getPlayerData(player)
-	if not pd then return end
-	for _, def in ipairs(ABILITY_FOLDERS) do
-		local folder = pd:FindFirstChild(def.key)
-		if folder then
-			for _, v in ipairs(folder:GetChildren()) do
-				if v:IsA("StringValue") then
-					valueConns[#valueConns + 1] = v.Changed:Connect(markDirty)
+	if pd then
+		add(pd.ChildAdded, structural)
+		add(pd.ChildRemoved, structural)
+		for _, def in ipairs(ABILITY_FOLDERS) do
+			local folder = pd:FindFirstChild(def.key)
+			if folder then
+				add(folder.ChildAdded, structural)
+				add(folder.ChildRemoved, structural)
+				for _, v in ipairs(folder:GetChildren()) do
+					if v:IsA("StringValue") then add(v.Changed, markDirty) end
 				end
 			end
 		end
@@ -559,36 +388,94 @@ end
 
 local function watchCharacter(char)
 	disconnectList(charConns)
+	watchedChar = char
 	if not char then return end
-	charConns[#charConns + 1] = char.ChildAdded:Connect(markDirty)
-	charConns[#charConns + 1] = char.ChildRemoved:Connect(markDirty)
+	charConns[#charConns + 1] = char.ChildAdded:Connect(markDirty)   -- tool equipped
+	charConns[#charConns + 1] = char.ChildRemoved:Connect(markDirty) -- tool unequipped
 end
 
-local function watch(player)
-	local function structural()
-		dirty = true
-		rebind = true
-	end
-	structConns[#structConns + 1] = player.DescendantAdded:Connect(structural)
-	structConns[#structConns + 1] = player.DescendantRemoved:Connect(structural)
-	structConns[#structConns + 1] = player.CharacterAdded:Connect(function(c)
+local function stopWatching()
+	disconnectList(selConns)
+	disconnectList(treeConns)
+	disconnectList(charConns)
+	watchedChar = nil
+end
+
+local function startWatching(player)
+	local ok, err = pcall(bindTree, player)
+	if not ok then warn("[AbilityTracker] " .. tostring(err)) end
+	watchCharacter(player.Character)
+	selConns[#selConns + 1] = player.CharacterAdded:Connect(function(c)
 		watchCharacter(c)
 		dirty = true
 	end)
-	watchCharacter(player.Character)
 end
 
-local acc = UPDATE_INTERVAL
-
+--------------------------------------------------------------------
+-- Rendering and the update loop
+--------------------------------------------------------------------
+-- Errors are caught so a bad read can never leave the old player's text on screen.
 local function render()
 	if not selected then return end
 	local ok, result = pcall(buildText, selected)
-	if ok then
-		detail.Text = result
-	else
-		detail.Text = "<b>" .. esc(selected.Name) .. "</b>\n\nCould not read this player's data."
+	if not ok then
 		warn("[AbilityTracker] " .. tostring(result))
+		result = "<b>" .. esc(selected.Name) .. "</b>\n\nCould not read this player's data."
 	end
+	if result ~= lastText then -- only touch the label when something changed
+		lastText = result
+		detail.Text = result
+	end
+end
+
+local safety = 0
+local function tickUpdate()
+	local p = selected
+	if not p then return end
+
+	safety += 1
+	if safety >= SAFETY_TICKS then
+		safety = 0
+		dirty = true -- full refresh once a second
+	end
+
+	-- character was replaced (respawn, skin swap): attach to the new one
+	if p.Character ~= watchedChar then
+		watchCharacter(p.Character)
+		dirty = true
+	end
+
+	if rebind then
+		rebind = false
+		local ok, err = pcall(bindTree, p)
+		if not ok then warn("[AbilityTracker] " .. tostring(err)) end
+		dirty = true
+	end
+
+	-- what they hold is checked directly, so equips can never be missed
+	local sig = heldSignature(p)
+	if sig ~= lastHeld then
+		lastHeld = sig
+		dirty = true
+	end
+
+	if dirty then
+		dirty = false
+		render()
+	end
+end
+
+-- The loop only exists while a player is selected and the panel is open.
+local function startLoop()
+	if loopRunning then return end
+	loopRunning = true
+	task.spawn(function()
+		while selected and not collapsed and gui.Parent do
+			task.wait(TICK)
+			if selected and not collapsed then tickUpdate() end
+		end
+		loopRunning = false
+	end)
 end
 
 local function selectPlayer(p)
@@ -596,22 +483,20 @@ local function selectPlayer(p)
 	for pl, b in pairs(rows) do
 		b.BackgroundColor3 = (pl == p) and SELECT_COLOR or ROW_COLOR
 	end
-	disconnectList(structConns)
-	disconnectList(valueConns)
-	disconnectList(charConns)
+	stopWatching()
+	lastHeld, lastText = nil, nil
+	dirty, rebind, safety = false, false, 0
 	if not p then
 		detail.Text = HINT
 		return
 	end
-	dirty, rebind = false, false
-	pcall(bindValues, p)
-	render()
-	local ok, err = pcall(watch, p)
-	if not ok then warn("[AbilityTracker] " .. tostring(err)) end
+	startWatching(p)
+	render() -- show the new player immediately
+	startLoop()
 end
 
 --------------------------------------------------------------------
--- Player list
+-- Player list (built once, then only touched when players join/leave)
 --------------------------------------------------------------------
 local function reorder()
 	local all = Players:GetPlayers()
@@ -650,33 +535,6 @@ keep(Players.PlayerAdded:Connect(addPlayer))
 keep(Players.PlayerRemoving:Connect(removePlayer))
 
 --------------------------------------------------------------------
--- Refresh loop
---------------------------------------------------------------------
-local statusAcc = 0
-keep(RunService.Heartbeat:Connect(function(dt)
-	if TrapDropper.enabled then
-		updateTraps(dt)
-		statusAcc += dt
-		if statusAcc >= 0.5 then
-			statusAcc = 0
-			status.Text = string.format("Found: %d   |   Owned: %d", TrapDropper.found, TrapDropper.owned)
-		end
-	end
-
-	if not dirty then return end
-	acc += dt
-	if acc < UPDATE_INTERVAL then return end
-	if not selected or collapsed then return end
-	acc = 0
-	dirty = false
-	if rebind then
-		rebind = false
-		pcall(bindValues, selected)
-	end
-	render()
-end))
-
---------------------------------------------------------------------
 -- Collapse / close
 --------------------------------------------------------------------
 local function setCollapsed(v)
@@ -684,19 +542,278 @@ local function setCollapsed(v)
 	body.Visible = not v
 	panel.Size = UDim2.fromOffset(PANEL_W, v and TITLE_H or PANEL_H)
 	collapseBtn.Text = v and "+" or "-"
-	if not v then dirty = true end
+	if v then
+		stopWatching() -- zero activity while folded
+	elseif selected then
+		startWatching(selected)
+		lastHeld, lastText = nil, nil
+		render()
+		startLoop()
+	end
 end
 collapseBtn.MouseButton1Click:Connect(function() setCollapsed(not collapsed) end)
 
 local function cleanup()
+	selected = nil
 	for _, c in ipairs(conns) do c:Disconnect() end
-	disconnectList(structConns)
-	disconnectList(valueConns)
-	disconnectList(charConns)
+	stopWatching()
 	gui:Destroy()
 	if _G.AbilityTrackerCleanup == cleanup then _G.AbilityTrackerCleanup = nil end
 end
 closeBtn.MouseButton1Click:Connect(cleanup)
 _G.AbilityTrackerCleanup = cleanup
+
+--------------------------------------------------------------------
+-- LovestruckTrap tester (client-side only; server may reject/revert changes)
+--------------------------------------------------------------------
+local trapEnabled = false
+local targetY = -500
+local trapRef = nil
+local trapStatus = nil
+local trapToggle = nil
+local trapYBox = nil
+local trapApply = nil
+local trapScanConnection = nil
+local trapStatusText = nil
+
+local function isAllowedFolderName(name)
+	return name == "ItemFolder" or name == "ItemFolder1" or name:match("^%d+$") ~= nil
+end
+
+local function findLovestruckTrap()
+	-- Search only under qualifying folders, wherever they occur beneath Workspace.
+	for _, inst in ipairs(workspace:GetDescendants()) do
+		if inst.Name == "LovestruckTrap" then
+			local ancestor = inst.Parent
+			while ancestor and ancestor ~= workspace do
+				if isAllowedFolderName(ancestor.Name) then
+					local root = inst:FindFirstChild("HumanoidRootPart", true)
+					if root and root:IsA("BasePart") then
+						return inst, root
+					end
+					break
+				end
+				ancestor = ancestor.Parent
+			end
+		end
+	end
+	return nil, nil
+end
+
+local trapPanel = Instance.new("Frame")
+trapPanel.Name = "LovestruckTrapTester"
+trapPanel.Size = UDim2.fromOffset(260, 176)
+trapPanel.Position = UDim2.fromOffset(304, 60)
+trapPanel.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
+trapPanel.BackgroundTransparency = 0.04
+trapPanel.Active = true
+trapPanel.Parent = gui
+round(trapPanel, 10)
+local trapStroke = Instance.new("UIStroke")
+trapStroke.Color = Color3.fromRGB(70, 70, 90)
+trapStroke.Thickness = 1
+trapStroke.Parent = trapPanel
+
+local trapHeader = Instance.new("Frame")
+trapHeader.Size = UDim2.new(1, 0, 0, 34)
+trapHeader.BackgroundColor3 = Color3.fromRGB(40, 40, 52)
+trapHeader.Active = true
+trapHeader.Parent = trapPanel
+round(trapHeader, 10)
+
+local trapTitle = Instance.new("TextLabel")
+trapTitle.Size = UDim2.new(1, -12, 1, 0)
+trapTitle.Position = UDim2.fromOffset(10, 0)
+trapTitle.BackgroundTransparency = 1
+trapTitle.Font = Enum.Font.GothamBold
+trapTitle.TextSize = 14
+trapTitle.TextColor3 = Color3.new(1, 1, 1)
+trapTitle.TextXAlignment = Enum.TextXAlignment.Left
+trapTitle.Text = "LovestruckTrap Tester"
+trapTitle.Parent = trapHeader
+
+local trapStatusTextLabel = Instance.new("TextLabel")
+trapStatusTextLabel.Name = "TrapStatus"
+trapStatusTextLabel.Position = UDim2.fromOffset(10, 42)
+trapStatusTextLabel.Size = UDim2.new(1, -20, 0, 38)
+trapStatusTextLabel.BackgroundTransparency = 1
+trapStatusTextLabel.Font = Enum.Font.Gotham
+trapStatusTextLabel.TextSize = 12
+trapStatusTextLabel.TextColor3 = Color3.fromRGB(220, 220, 230)
+trapStatusTextLabel.TextXAlignment = Enum.TextXAlignment.Left
+trapStatusTextLabel.TextYAlignment = Enum.TextYAlignment.Top
+trapStatusTextLabel.TextWrapped = true
+trapStatusTextLabel.Text = "Searching for LovestruckTrap..."
+trapStatusTextLabel.Parent = trapPanel
+trapStatusText = trapStatusTextLabel
+
+local yLabel = Instance.new("TextLabel")
+yLabel.Position = UDim2.fromOffset(10, 83)
+yLabel.Size = UDim2.fromOffset(68, 30)
+yLabel.BackgroundTransparency = 1
+yLabel.Font = Enum.Font.GothamMedium
+yLabel.TextSize = 13
+yLabel.TextColor3 = Color3.new(1, 1, 1)
+yLabel.Text = "Target Y:"
+yLabel.Parent = trapPanel
+
+trapYBox = Instance.new("TextBox")
+trapYBox.Name = "TargetY"
+trapYBox.Position = UDim2.fromOffset(78, 83)
+trapYBox.Size = UDim2.fromOffset(70, 30)
+trapYBox.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
+trapYBox.TextColor3 = Color3.new(1, 1, 1)
+trapYBox.PlaceholderText = "-500"
+trapYBox.Text = "-500"
+trapYBox.ClearTextOnFocus = false
+trapYBox.Font = Enum.Font.Gotham
+trapYBox.TextSize = 13
+trapYBox.Parent = trapPanel
+round(trapYBox, 7)
+
+trapToggle = newButton(trapPanel, "Enable: OFF", UDim2.fromOffset(92, 30), Color3.fromRGB(75, 75, 92))
+trapToggle.Position = UDim2.fromOffset(156, 83)
+trapToggle.TextSize = 12
+
+trapApply = newButton(trapPanel, "Apply Y Position", UDim2.new(1, -20, 0, 32), Color3.fromRGB(70, 110, 200))
+trapApply.Position = UDim2.fromOffset(10, 128)
+trapApply.TextSize = 13
+
+local function refreshTrapReference()
+	local model, root = findLovestruckTrap()
+	trapRef = model
+	trapStatus = root
+	if root then
+		trapStatusText.Text = "Found LovestruckTrap • HRP ready"
+	else
+		trapStatusText.Text = "Trap not found in a supported folder."
+	end
+end
+
+local function getTargetY()
+	local value = tonumber(trapYBox.Text)
+	if not value or value ~= value or value == math.huge or value == -math.huge then
+		return nil
+	end
+	return math.clamp(value, -100000, 100000)
+end
+
+trapYBox.FocusLost:Connect(function()
+	local value = getTargetY()
+	if value then
+		targetY = value
+		trapYBox.Text = tostring(value)
+	else
+		trapYBox.Text = tostring(targetY)
+	end
+end)
+
+trapToggle.MouseButton1Click:Connect(function()
+	trapEnabled = not trapEnabled
+	trapToggle.Text = trapEnabled and "Enable: ON" or "Enable: OFF"
+	trapToggle.BackgroundColor3 = trapEnabled and Color3.fromRGB(45, 145, 85) or Color3.fromRGB(75, 75, 92)
+	if trapEnabled then
+		refreshTrapReference()
+		if trapStatus then
+			trapStatusText.Text = "Enabled • move only when nearby"
+		end
+	else
+		trapStatusText.Text = trapStatus and "Found LovestruckTrap • disabled" or "Trap not found in a supported folder."
+	end
+end)
+
+trapApply.MouseButton1Click:Connect(function()
+	local value = getTargetY()
+	if not value then
+		trapStatusText.Text = "Enter a valid numeric Y coordinate."
+		return
+	end
+	targetY = value
+	trapYBox.Text = tostring(value)
+	refreshTrapReference()
+	if not trapEnabled then
+		trapStatusText.Text = "Turn Enable ON first."
+		return
+	end
+	if not trapStatus or not trapStatus.Parent then
+		trapStatusText.Text = "Trap HRP not found."
+		return
+	end
+	local character = LocalPlayer.Character
+	local playerRoot = character and character:FindFirstChild("HumanoidRootPart")
+	if not playerRoot then
+		trapStatusText.Text = "Your character HRP is unavailable."
+		return
+	end
+	local distance = (playerRoot.Position - trapStatus.Position).Magnitude
+	if distance > 35 then
+		trapStatusText.Text = string.format("Too far away (%.0f studs). Get within 35 studs.", distance)
+		return
+	end
+	-- Client-side attempt only. Network ownership/server rules may reject or undo this.
+	local ok, err = pcall(function()
+		local old = trapStatus.CFrame
+		trapStatus.CFrame = CFrame.new(old.Position.X, targetY, old.Position.Z) * (old - old.Position)
+	end)
+	if ok then
+		trapStatusText.Text = "Local CFrame change attempted. Server may revert it."
+	else
+		trapStatusText.Text = "Move failed: " .. tostring(err)
+	end
+end)
+
+-- Lightweight polling while enabled; avoids a per-frame scan.
+task.spawn(function()
+	local lastRoot = nil
+	while gui.Parent do
+		task.wait(0.5)
+		if trapEnabled then
+			if not trapStatus or not trapStatus.Parent then
+				refreshTrapReference()
+			end
+			local character = LocalPlayer.Character
+			local playerRoot = character and character:FindFirstChild("HumanoidRootPart")
+			if trapStatus and playerRoot then
+				local distance = (playerRoot.Position - trapStatus.Position).Magnitude
+				if distance > 35 then
+					trapStatusText.Text = string.format("Found trap • %.0f studs away", distance)
+				elseif distance <= 35 then
+					trapStatusText.Text = string.format("Nearby • %.0f studs • press Apply", distance)
+				end
+			end
+		end
+	end
+end)
+
+-- Make the added panel draggable by its title bar.
+do
+	local activeInput, startInputPos, startPos
+	trapHeader.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+			activeInput = input
+			startInputPos = Vector2.new(input.Position.X, input.Position.Y)
+			startPos = trapPanel.Position
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if not activeInput then return end
+		local matches = input == activeInput or (activeInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement)
+		if not matches then return end
+		local delta = Vector2.new(input.Position.X, input.Position.Y) - startInputPos
+		local screen = gui.AbsoluteSize
+		local size = trapPanel.AbsoluteSize
+		trapPanel.Position = UDim2.fromOffset(
+			math.clamp(startPos.X.Offset + delta.X, 0, math.max(0, screen.X - size.X)),
+			math.clamp(startPos.Y.Offset + delta.Y, 0, math.max(0, screen.Y - size.Y))
+		)
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if activeInput and (input == activeInput or (activeInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseButton1)) then
+			activeInput = nil
+		end
+	end)
+end
+
+refreshTrapReference()
 
 gui.Parent = playerGui
